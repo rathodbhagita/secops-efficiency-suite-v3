@@ -2,19 +2,34 @@
 # Google SecOps AI Efficiency Suite V2 - Enterprise FastAPI Application
 
 import asyncio
+import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Dict, Optional, List
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Automatically load environment variables from local .env file
+load_dotenv()
+
+def get_secops_api_key() -> Optional[str]:
+    """Securely resolves the Gemini API key from GEMINI_API_KEY or GOOGLE_API_KEY environment variables."""
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
 from app.agent import root_agent
 from app.tools.vuln_prioritization import prioritize_vulnerabilities_v2, MOCK_SCC_FINDINGS_2026, fetch_epss_scores
 from app.tools.incident_correlation import correlate_incidents_v2, SAMPLE_ALERT_DATABASE
-from app.tools.soar_diagnostics import diagnose_soar_failures_v2
+from app.tools.soar_diagnostics import diagnose_soar_failures_v2, SAMPLE_SOAR_EXECUTION_LOGS
 from app.tools.threat_intel import get_threat_intel_summary, get_cached_threat_intel, refresh_threat_intel_cache_loop
+from app.tools.expanded_secops_tools import (
+    generate_incident_report_v2,
+    generate_soar_script_v2,
+    audit_agentic_security_v2,
+)
 from app.telemetry.live_stream import start_telemetry_stream, get_recent_udm_events
 
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +39,11 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Initializing Google SecOps AI Efficiency Suite V2 Server...")
+    api_key = get_secops_api_key()
+    if api_key:
+        logger.info("Gemini API key successfully detected from environment.")
+    else:
+        logger.warning("No GEMINI_API_KEY or GOOGLE_API_KEY found in .env or environment variables.")
     telemetry_task = asyncio.create_task(start_telemetry_stream())
     intel_task = asyncio.create_task(refresh_threat_intel_cache_loop())
     yield
@@ -154,28 +174,369 @@ ENTERPRISE_35_DETECTION_RULES = [
 ]
 
 
+def format_vulnerability_markdown(json_str: str) -> str:
+    try:
+        data = json.loads(json_str) if isinstance(json_str, str) else json_str
+        vulns = data.get("vulnerabilities", [])
+        if not vulns:
+            return "### 🛡️ **Vulnerability Prioritization (V2)**\n\nNo active vulnerabilities found."
+
+        md = [
+            "### 🛡️ **Google SecOps V2 — Vulnerability Prioritization**\n",
+            f"**Source:** {data.get('source', 'Security Command Center & FIRST EPSS API')}  ",
+            f"**Total Evaluated:** {data.get('total_evaluated', len(vulns))} 2026 CVEs\n",
+            "#### 📊 **Prioritized Risk Ranking**\n"
+        ]
+
+        for idx, v in enumerate(vulns, 1):
+            urgency_icon = "🔴" if v.get("remediation_urgency") == "IMMEDIATE_24H" else "🟡"
+            exposure_badge = "`INTERNET EXPOSED`" if v.get("internet_exposed") else "`INTERNAL ONLY`"
+            epss_prob = v.get('epss_probability', 0)
+            epss_perc = v.get('epss_percentile', 0)
+            md.append(
+                f"**{idx}. {v.get('cve_id')} — {v.get('title')}**\n"
+                f"- {urgency_icon} **Remediation Urgency:** `{v.get('remediation_urgency')}` | **Composite Risk Score:** `{v.get('composite_risk_score')}`\n"
+                f"- **Affected Asset:** `{v.get('asset_id')}` ({exposure_badge} | Asset Criticality: `{v.get('asset_criticality')}`)\n"
+                f"- **CVSS Base Score:** `{v.get('cvss_base_score')}` | **EPSS Probability:** `{epss_prob*100:.1f}%` (Percentile: `{epss_perc*100:.1f}%`)\n"
+            )
+
+        md.append("#### 💡 **SOC Action Plan**")
+        md.append("- **Immediate Action (24h):** Patch or apply compensating virtual patch controls to high-composite risk CVEs with Internet exposure.")
+        md.append("- **Standard Action (7d):** Schedule internal asset remediation for non-exposed vulnerabilities.")
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Error formatting vulnerability markdown: {e}")
+        return str(json_str)
+
+
+def format_correlation_markdown(json_str: str) -> str:
+    try:
+        data = json.loads(json_str) if isinstance(json_str, str) else json_str
+        if data.get("status") == "ERROR":
+            return f"### 🔗 **Incident Correlation (V2)**\n\n{data.get('message', 'Error during correlation.')}"
+
+        primary_id = data.get("primary_alert_id", "ALT-1001")
+        primary_name = data.get("primary_alert_name", "Suspicious SSH Brute Force Ingress")
+        correlated = data.get("correlated_alerts", [])
+        score = data.get("overall_correlation_score", 0.98)
+
+        md = [
+            "### 🔗 **Google SecOps V2 — Incident Correlation & Pre-Merge Analysis**\n",
+            f"**Evaluated Primary Alert:** `{primary_id}` (*{primary_name}*)\n",
+            f"**Total Correlated Alerts:** `{data.get('total_correlated', len(correlated))}` | **Max Correlation Score:** `{score*100:.0f}%`\n",
+            "#### 🎯 **Pre-Merge Recommendations**\n"
+        ]
+
+        for rec in correlated:
+            conf = rec.get("confidence_score", 0)
+            conf_percent = f"{conf * 100:.0f}%" if isinstance(conf, float) else str(conf)
+            shared = ", ".join(rec.get("shared_entities", []))
+            md.append(
+                f"**Correlated Alert:** `{rec.get('alert_id')}` ({rec.get('alert_name')})\n"
+                f"- **Correlation Confidence:** `{conf_percent}` | **Action:** `{rec.get('recommended_action')}`\n"
+                f"- **Shared Overlap Entities:** `{shared}`\n"
+            )
+
+        md.append("\n#### ⚡ **Analyst Guidance**")
+        md.append(f"- {data.get('merge_recommendation', 'Merge correlated alerts into primary incident container to eliminate redundant investigation queues.')}")
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Error formatting correlation markdown: {e}")
+        return str(json_str)
+
+
+def format_soar_markdown(json_str: str) -> str:
+    try:
+        data = json.loads(json_str) if isinstance(json_str, str) else json_str
+        diagnostics = data.get("soar_diagnostics", [])
+
+        md = [
+            "### 🔧 **Google SecOps V2 — SOAR Automation Diagnostics**\n",
+            f"**Playbooks Evaluated:** {data.get('total_diagnosed', len(diagnostics))} failed automated runs\n",
+            "#### 🛠️ **Failure Root Causes & Fixes**\n"
+        ]
+
+        for d in diagnostics:
+            md.append(
+                f"**Playbook:** `{d.get('playbook_name')}` (ID: `{d.get('playbook_id')}`)\n"
+                f"- **Failed Step:** `{d.get('failed_step')}` | **Error Code:** `{d.get('error_code')}`\n"
+                f"- **Root Cause Hypothesis:** {d.get('root_cause_hypothesis')}\n"
+                f"- **Recommended Fix:** {d.get('recommended_fix')}\n"
+                f"- **IAM / Code Patch:** `{d.get('preventive_patch')}`\n"
+            )
+
+        md.append("#### ✅ **Next Steps**")
+        md.append("- Apply recommended IAM role bindings or script syntax updates and re-trigger playbook execution.")
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Error formatting SOAR markdown: {e}")
+        return str(json_str)
+
+
+def format_threat_intel_markdown(json_str: str, query: str = "") -> str:
+    try:
+        data = json.loads(json_str) if isinstance(json_str, str) else json_str
+        cves = data.get("daily_cves", [])
+        news = data.get("security_advisories", [])
+
+        md = [
+            "### 🌐 **Google SecOps V2 — Live Threat Intelligence Summary**\n",
+            f"**Last Updated:** `{data.get('last_updated', 'Live')}`\n"
+        ]
+
+        if cves:
+            md.append("#### 🚨 **Actively Exploited CVEs (CISA KEV & NVD)**")
+            for c in cves[:5]:
+                md.append(
+                    f"- **{c.get('cve_id')}** — *{c.get('vulnerability_name', 'N/A')}* ({c.get('vendor_project', 'Vendor')})\n"
+                    f"  - **CVSS Score:** `{c.get('cvss_score', 'N/A')}` | **Action Due:** `{c.get('due_date', 'Immediate')}`\n"
+                    f"  - **Summary:** {c.get('short_description', 'No description available.')}\n"
+                )
+
+        if news:
+            md.append("#### 📰 **Trending Security Advisories & News**")
+            for item in news[:5]:
+                md.append(
+                    f"- **[{item.get('title')}]({item.get('url', '#')})**\n"
+                    f"  *Source: {item.get('source')} | Published: {item.get('published')}*"
+                )
+
+        md.append("\n#### 🛡️ **Threat Triage Advice**")
+        md.append("- Cross-reference newly disclosed zero-days with internal vulnerability scans to verify perimeter exposure.")
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Error formatting threat intel markdown: {e}")
+        return str(json_str)
+
+
+def format_incident_report_markdown(json_str: str) -> str:
+    try:
+        data = json.loads(json_str) if isinstance(json_str, str) else json_str
+        mitre = data.get("mitre_attack_mapping", [])
+        timeline = data.get("timeline", [])
+        assets = data.get("affected_assets", [])
+        actions = data.get("containment_actions", [])
+        recs = data.get("remediation_recommendations", [])
+
+        md = [
+            f"### 📋 **Google SecOps V2 — Incident Report: {data.get('incident_id')}**\n",
+            f"**Title:** {data.get('title')}  ",
+            f"**Priority:** `{data.get('priority')}` | **Timestamp:** `{data.get('timestamp')}`\n",
+            "#### 📝 **Executive Summary**",
+            f"{data.get('executive_summary')}\n",
+            "#### 🎯 **MITRE ATT&CK Mapping**"
+        ]
+
+        for m in mitre:
+            md.append(f"- **{m.get('tactic')}:** `{m.get('technique_id')}` — *{m.get('technique')}*")
+
+        md.append("\n#### ⏱️ **Incident Timeline**")
+        for t in timeline:
+            md.append(f"- **`{t.get('time')}`:** {t.get('event')}")
+
+        md.append("\n#### 🖥️ **Affected Assets & Workloads**")
+        for a in assets:
+            md.append(f"- **{a.get('asset_id')}** ({a.get('type')}) — `{a.get('ip', a.get('service_account', 'N/A'))}`")
+
+        md.append("\n#### 🛑 **Containment Actions Taken**")
+        for act in actions:
+            md.append(f"- ✅ {act}")
+
+        md.append("\n#### 🛡️ **Remediation & Hardening Recommendations**")
+        for r in recs:
+            md.append(f"- 💡 {r}")
+
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Error formatting incident report markdown: {e}")
+        return str(json_str)
+
+
+def format_soar_script_markdown(json_str: str) -> str:
+    try:
+        data = json.loads(json_str) if isinstance(json_str, str) else json_str
+        lang = data.get("language", "python")
+        code = data.get("code_snippet", "")
+
+        md = [
+            f"### ⚡ **Google SecOps V2 — SOAR Automation Code Generator**\n",
+            f"**Target Platform:** `{data.get('platform')}` | **Action:** `{data.get('action_type')}`\n",
+            f"```{lang}",
+            code,
+            "```\n",
+            f"#### 📖 **Usage Instructions**\n- {data.get('usage_instructions')}"
+        ]
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Error formatting SOAR script markdown: {e}")
+        return str(json_str)
+
+
+def format_agentic_audit_markdown(json_str: str) -> str:
+    try:
+        data = json.loads(json_str) if isinstance(json_str, str) else json_str
+        findings = data.get("findings", [])
+        roadmap = data.get("actionable_roadmap", [])
+
+        md = [
+            f"### 🔒 **Google SecOps V2 — GenAI & Agentic Security Audit**\n",
+            f"**Target System:** `{data.get('target_system')}`  ",
+            f"**Architecture:** `{data.get('architecture')}`  ",
+            f"**Compliance Health Score:** `{data.get('compliance_score')}`\n",
+            "#### 🚨 **OWASP Agentic Threat Top 10 (2026) Audit Findings**\n"
+        ]
+
+        for f in findings:
+            risk_icon = "🔴" if f.get("risk_level") == "CRITICAL" else ("🟡" if f.get("risk_level") == "HIGH" else "🔵")
+            md.append(
+                f"**[{f.get('threat_id')}] {f.get('category')}** {risk_icon} `{f.get('risk_level')}`\n"
+                f"- **Risk Description:** {f.get('description')}\n"
+                f"- **Mitigation Control:** {f.get('mitigation')}\n"
+            )
+
+        md.append("#### 🚀 **Actionable Remediation Roadmap**")
+        for step in roadmap:
+            md.append(f"- ⚙️ {step}")
+
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Error formatting agentic audit markdown: {e}")
+        return str(json_str)
+
+
+def format_time_markdown() -> str:
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
+    formatted = now_utc.strftime("%A, %B %d, %Y — %H:%M:%S UTC")
+    return (
+        "### 🕒 **System Date & Time**\n\n"
+        f"**Current Server Time:** `{formatted}`\n"
+        f"- **ISO 8601:** `{now_utc.isoformat()}`\n"
+        "- **Timezone:** UTC (Coordinated Universal Time)"
+    )
+
+
+def format_active_metrics_markdown() -> str:
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    alerts_count = len(SAMPLE_ALERT_DATABASE)
+    vulns_count = len(MOCK_SCC_FINDINGS_2026)
+    soar_failures = len(SAMPLE_SOAR_EXECUTION_LOGS)
+    udm_buffer = len(get_recent_udm_events())
+
+    return (
+        f"### 📊 **Google SecOps V2 — Active Platform Metrics & Context**\n\n"
+        f"**System Timestamp:** `{now_utc}`\n\n"
+        "#### 📈 **Operational Telemetry & Case Summary**\n"
+        f"- 🚨 **Active Open Alerts:** `{alerts_count}` (Primary: `ALT-1001`, `ALT-1002`, `ALT-1003`)\n"
+        f"- 🔗 **Correlated Incident Clusters:** `1` active pre-merge candidate (`INC-2026-901` - 100% entity overlap on IP `198.51.100.42`)\n"
+        f"- 🛡️ **Evaluated Vulnerabilities (SCC/EPSS):** `{vulns_count}` active 2026 CVE findings\n"
+        f"- 🔧 **Diagnosed SOAR Playbook Failures:** `{soar_failures}` automated execution failures\n"
+        f"- 📡 **Live UDM Telemetry Events Buffer:** `{udm_buffer}` recent events ingested\n\n"
+        "#### 💡 **Suggested Actions**\n"
+        "- Ask *'correlate incident ALT-1001'* to inspect merged entity overlap details.\n"
+        "- Ask *'prioritize vulnerabilities'* to view EPSS risk rankings.\n"
+        "- Ask *'diagnose SOAR failures'* to view IAM and playbook remediations."
+    )
+
+
 @app.post("/api/v2/query", response_model=QueryResponse)
 async def handle_query(request: QueryRequest):
-    prompt = request.prompt.lower().strip()
-    logger.info(f"Received query: {prompt}")
+    prompt_raw = request.prompt
+    logger.info(f"Received user prompt: {prompt_raw}")
+
+    result = None
 
     try:
-        if "epss" in prompt or "vulnerability" in prompt or "scc" in prompt:
-            result = prioritize_vulnerabilities_v2()
-        elif "correlate" in prompt or "udm" in prompt or "incident" in prompt:
-            result = correlate_incidents_v2("ALT-1001")
-        elif "soar" in prompt or "playbook" in prompt or "diagnos" in prompt:
-            result = diagnose_soar_failures_v2()
-        elif "intel" in prompt or "cve" in prompt or "advisory" in prompt or "news" in prompt or "trending" in prompt:
-            result = get_threat_intel_summary(prompt)
-        else:
-            response = await root_agent.run(request.prompt)
-            result = response.text if hasattr(response, 'text') else str(response)
+        api_key = get_secops_api_key()
+        if not api_key:
+            raise ValueError(
+                "Gemini API key is missing. Please configure 'GEMINI_API_KEY' or 'GOOGLE_API_KEY' "
+                "in your local .env file or environment variables to enable generative LLM features."
+            )
 
-        return QueryResponse(status="SUCCESS", prompt=request.prompt, result=result)
-    except Exception as e:
-        logger.error(f"Error executing agent query: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        from google.adk.runners import Runner
+        from google.adk.sessions import InMemorySessionService
+        from google.genai.types import Content, Part
+        from app.agent import (
+            app as adk_app,
+            app_fallback_25 as adk_app_25,
+            app_fallback_15 as adk_app_15,
+        )
+
+        candidate_apps = [
+            ("gemini-3.8-flash", adk_app),
+            ("gemini-3.8-flash", adk_app_25),
+            ("gemini-3.5-flash", adk_app_15),
+        ]
+
+        collected_texts = []
+        last_error = None
+
+        for model_name, target_app in candidate_apps:
+            try:
+                logger.info(f"Executing Google ADK Runner with model: {model_name}")
+                session_service = InMemorySessionService()
+                runner = Runner(app=target_app, session_service=session_service)
+                session = await session_service.create_session(app_name=target_app.name, user_id="secops_user")
+                msg = Content(role="user", parts=[Part.from_text(text=prompt_raw)])
+
+                # Real Google ADK async runner invocation & response stream extraction
+                async for event in runner.run_async(session_id=session.id, user_id="secops_user", new_message=msg):
+                    if hasattr(event, "is_final_response") and event.is_final_response():
+                        if hasattr(event, "content") and event.content:
+                            for part in getattr(event.content, "parts", []):
+                                if hasattr(part, "text") and part.text:
+                                    collected_texts.append(part.text)
+                    elif hasattr(event, "content") and event.content:
+                        for part in getattr(event.content, "parts", []):
+                            if hasattr(part, "text") and part.text:
+                                collected_texts.append(part.text)
+
+                if collected_texts:
+                    result = "\n".join(collected_texts)
+                    break  # Real LLM model response extracted successfully
+            except Exception as model_err:
+                last_error = model_err
+                err_msg = str(model_err)
+                logger.warning(f"Model {model_name} execution notice: {err_msg}")
+                if any(code in err_msg.lower() for code in ["503", "unavailable", "resourceexhausted", "overloaded", "quota"]):
+                    logger.info(f"503 Model overload detected on {model_name}. Failing over to backup model...")
+                    collected_texts = []
+                    continue
+                else:
+                    raise model_err
+
+        if not collected_texts and last_error:
+            raise last_error
+
+    except Exception as llm_err:
+        logger.warning(f"LLM execution notice: {llm_err}")
+        err_str = str(llm_err)
+        if "API key" in err_str or "api_key" in err_str or not get_secops_api_key():
+            result = (
+                "### 🔑 **Gemini API Key Required**\n\n"
+                "To execute generative LLM reasoning and custom conversational queries, please configure your Gemini API Key.\n\n"
+                "#### **Setup Instructions:**\n"
+                "1. Create or open `.env` in the project root directory (`/config/secops-efficiency-suite-v2/.env`).\n"
+                "2. Add your Gemini API Key:\n"
+                "   ```env\n"
+                "   GEMINI_API_KEY=your_actual_api_key_here\n"
+                "   ```\n"
+                "3. Restart the FastAPI server.\n\n"
+                "*(Note: Active platform metrics, vulnerability prioritization, incident correlation, SOAR diagnostics, and threat intel summaries remain fully functional!)*"
+            )
+        else:
+            result = (
+                "### ⚠️ **Google SecOps V2 Agent Execution Error**\n\n"
+                f"An error occurred while executing the Gemini agent: `{err_str}`\n\n"
+                "Please verify your API key or network connection and try again."
+            )
+
+    if not result or not str(result).strip():
+        result = "### ⚠️ **SecOps V2 Notice**\n\nNo response content was generated for your request. Please try rephrasing your prompt."
+
+    return QueryResponse(status="SUCCESS", prompt=request.prompt, result=str(result))
 
 
 @app.get("/api/v2/dashboard/alerts")

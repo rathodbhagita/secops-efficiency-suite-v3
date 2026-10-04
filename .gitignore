@@ -48,3 +48,6 @@ Thumbs.db
 *.log
 logs/
 .system_generated/
+.env
+__pycache__/
+venv/

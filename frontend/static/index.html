@@ -557,11 +557,17 @@
         const data = await resp.json();
         removeElement(typingId);
 
-        let formattedText = data.result;
-        try {
-          const parsedJson = JSON.parse(data.result);
-          formattedText = '```json\n' + JSON.stringify(parsedJson, null, 2) + '\n```';
-        } catch(e) {}
+        let rawResult = data && data.result !== undefined && data.result !== null && String(data.result).trim() !== ''
+          ? data.result
+          : (data && data.detail ? `⚠️ **Server Notice:** ${data.detail}` : '⚠️ **Notice:** Received empty response from SecOps Agent.');
+
+        let formattedText = typeof rawResult === 'object' ? JSON.stringify(rawResult, null, 2) : String(rawResult);
+        if (formattedText.trim().startsWith('{') || formattedText.trim().startsWith('[')) {
+          try {
+            const parsedJson = JSON.parse(formattedText);
+            formattedText = '```json\n' + JSON.stringify(parsedJson, null, 2) + '\n```';
+          } catch(e) {}
+        }
 
         appendMessage('assistant', formattedText);
       } catch (err) {
@@ -581,7 +587,10 @@
 
       const bubble = document.createElement('div');
       bubble.className = 'speech-bubble';
-      bubble.innerHTML = typeof marked !== 'undefined' ? marked.parse(text) : text;
+      const safeText = text !== null && text !== undefined && String(text).trim() !== ''
+        ? String(text)
+        : '⚠️ *No response message returned.*';
+      bubble.innerHTML = typeof marked !== 'undefined' ? marked.parse(String(safeText)) : safeText;
 
       row.appendChild(avatar);
       row.appendChild(bubble);
